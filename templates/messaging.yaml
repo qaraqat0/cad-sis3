@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: SIS 3 - messaging stack (SNS domain event -> SQS with DLQ -> idempotent Lambda consumer -> DynamoDB)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: sis3
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30]
+  MaxReceiveCount:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Receives before a message moves to the DLQ (lecture rule - at least 5)
+
+Resources:
+  # Domain event "OrderCreated" is published here by the container app
+  OrdersTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-orders"
+
+  OrdersDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-orders-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days, longer than the source queue
+      SqsManagedSseEnabled: true
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-orders-queue"
+      VisibilityTimeout: 120 # >= 6 x Lambda timeout (10 s)
+      MessageRetentionPeriod: 345600 # 4 days
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+
+  OrdersQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OrdersQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowOnlyOurTopic
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrdersQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrdersTopic
+
+  OrdersSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrdersTopic
+      Protocol: sqs
+      Endpoint: !GetAtt OrdersQueue.Arn
+      RawMessageDelivery: true # body = our event JSON, not the SNS envelope
+
+  # Idempotency store: one item per eventId (the deduplication key)
+  ProcessedEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-processed-events"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-consumer"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: consumer-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt OrdersQueue.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt ProcessedEventsTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ConsumerLogGroup.Arn
+
+  ConsumerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-consumer"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 128
+      Role: !GetAtt ConsumerRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ConsumerLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ProcessedEventsTable
+      Code:
+        ZipFile: |
+          import json, os, boto3
+
+          ddb = boto3.client("dynamodb")
+          TABLE = os.environ["TABLE_NAME"]
+
+          def handler(event, context):
+              failures = []
+              for record in event["Records"]:
+                  try:
+                      msg = json.loads(record["body"])
+                      event_id = msg["eventId"]          # deduplication key
+                      try:
+                          # Conditional write: succeeds only the first time this eventId is seen
+                          ddb.put_item(
+                              TableName=TABLE,
+                              Item={
+                                  "eventId": {"S": event_id},
+                                  "type": {"S": msg.get("type", "unknown")},
+                                  "orderId": {"S": str(msg.get("orderId", ""))},
+                                  "payload": {"S": json.dumps(msg)},
+                              },
+                              ConditionExpression="attribute_not_exists(eventId)",
+                          )
+                          print(json.dumps({"result": "processed", "eventId": event_id}))
+                      except ddb.exceptions.ConditionalCheckFailedException:
+                          print(json.dumps({"result": "duplicate_skipped", "eventId": event_id}))
+                  except Exception as e:
+                      # Bad message: report only this one as failed -> retried -> DLQ after maxReceiveCount
+                      print(json.dumps({"result": "error", "messageId": record["messageId"], "error": str(e)}))
+                      failures.append({"itemIdentifier": record["messageId"]})
+              return {"batchItemFailures": failures}
+
+  ConsumerEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt OrdersQueue.Arn
+      FunctionName: !Ref ConsumerFunction
+      BatchSize: 10
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+Outputs:
+  TopicArn:
+    Value: !Ref OrdersTopic
+    Export:
+      Name: !Sub "${ProjectName}-TopicArn"
+  QueueUrl:
+    Value: !Ref OrdersQueue
+  DlqUrl:
+    Value: !Ref OrdersDLQ
+  TableName:
+    Value: !Ref ProcessedEventsTable

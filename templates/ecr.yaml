@@ -1,0 +1,46 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: SIS 3 - container registry (ECR with immutable tags, scan on push, lifecycle policy)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: sis3
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+  KeepImages:
+    Type: Number
+    Default: 5
+    MinValue: 1
+
+Resources:
+  AppRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-app"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last ${KeepImages} images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${KeepImages}
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+Outputs:
+  RepositoryName:
+    Value: !Ref AppRepository
+  RepositoryUri:
+    Value: !GetAtt AppRepository.RepositoryUri
+    Export:
+      Name: !Sub "${ProjectName}-RepoUri"
