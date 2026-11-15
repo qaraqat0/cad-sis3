@@ -40,7 +40,7 @@ if aws ecr describe-images --repository-name "$P-app" --image-ids imageTag="$TAG
 else
   echo ">>> Building and pushing $REPO_URI:$TAG"
   aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO_URI%%/*}"
-  docker build --platform linux/arm64 -t "$REPO_URI:$TAG" app
+  docker build --provenance=false --platform linux/arm64 -t "$REPO_URI:$TAG" app
   docker push "$REPO_URI:$TAG"
 fi
 
