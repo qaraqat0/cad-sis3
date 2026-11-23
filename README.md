@@ -100,3 +100,30 @@ checkov -d templates --framework cloudformation --quiet
 ```
 
 Deletes app → ecr → messaging → network. The ECR repo is emptied automatically (`EmptyOnDelete`).
+
+## CI/CD (Practice 7): GitHub Actions + OIDC
+
+Every push to `main` runs `.github/workflows/deploy.yml`:
+
+1. **test** (no AWS access): `cfn-lint templates/*.yaml` and `python -m unittest discover -s app` (SNS is mocked).
+2. **deploy** (GitHub Environment `production`, native ARM64 runner):
+   OIDC → `gha-deploy-sis3` → deploy network / messaging / ECR stacks → build the image tagged with the **full commit SHA** → push to ECR → gate on zero CRITICAL scan findings → deploy `sis3-app` with `ImageTag=$GITHUB_SHA` (new task definition revision) → smoke test: the ALB must answer `"version": "<sha>"`.
+
+No AWS keys are stored in GitHub. The deploy role can only push to `sis3-app` in ECR and hand templates to CloudFormation; CloudFormation creates the resources as `cfn-exec-sis3`.
+
+### One-time setup
+
+1. Get the numeric ids: open `https://api.github.com/repos/qaraqat0/cad-sis3` → top-level `id` (repo) and `owner.id`.
+2. CloudFormation → Create stack → upload `templates/github-oidc.yaml`, stack name **`gha-oidc-sis3`** (must not start with `sis3-`), fill both ids, tick the IAM acknowledgement.
+3. Copy output `DeployRoleArn` to GitHub → Settings → Secrets and variables → Actions → **Variables** → `DEPLOY_ROLE_ARN`.
+
+Trust policy condition (immutable subject format for repos created after 15 Jul 2026):
+
+```
+token.actions.githubusercontent.com:aud = sts.amazonaws.com
+token.actions.githubusercontent.com:sub = repo:qaraqat0@<ownerId>/cad-sis3@<repoId>:environment:production
+```
+
+### Teardown
+
+Actions → **destroy** → Run workflow → type `sis3`. Then (optionally) delete the `gha-oidc-sis3` stack.

@@ -1,0 +1,46 @@
+# Manual teardown: Actions -> destroy -> Run workflow -> type the project name.
+# Deletes app -> ecr -> messaging -> network (app imports from the others, so it goes first).
+name: destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type the project name (sis3) to delete all its stacks
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT: sis3
+
+jobs:
+  destroy:
+    if: ${{ inputs.confirm == 'sis3' }}
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete stacks in dependency order
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          CFN_ROLE="arn:aws:iam::${ACCOUNT}:role/cfn-exec-${PROJECT}"
+          for s in app ecr messaging network; do
+            echo ">>> Deleting $PROJECT-$s"
+            aws cloudformation delete-stack --stack-name "$PROJECT-$s" --role-arn "$CFN_ROLE"
+            aws cloudformation wait stack-delete-complete --stack-name "$PROJECT-$s"
+          done
+          echo "All $PROJECT stacks deleted." | tee -a "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,139 @@
+# Practice 7: continuous deployment to one environment.
+# Every push to main: lint + unit tests -> build ARM64 image tagged with the commit SHA ->
+# push to ECR -> scan gate -> deploy the SIS 3 CloudFormation stacks -> smoke test.
+# AWS access comes from OIDC (no keys stored in GitHub).
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT: sis3
+
+jobs:
+  test:
+    name: Lint and unit tests (no AWS access)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test tools
+        run: pip install boto3 cfn-lint
+
+      - name: Lint CloudFormation templates
+        run: cfn-lint templates/*.yaml
+
+      - name: Unit tests
+        run: python -m unittest discover -s app -v
+
+  deploy:
+    name: Build, push and deploy
+    needs: test
+    runs-on: ubuntu-24.04-arm # native ARM64 build for the ARM64 Fargate task
+    environment: production # OIDC sub becomes ...:environment:production
+    permissions:
+      id-token: write # required for OIDC
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show OIDC subject (claims only, never the token)
+        run: |
+          curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
+          | python3 -c 'import sys,json,base64; t=json.load(sys.stdin)["value"].split(".")[1]; t+="="*(-len(t)%4); c=json.loads(base64.urlsafe_b64decode(t)); print(json.dumps({k:c.get(k) for k in ("sub","aud","repository","environment","ref")}, indent=2))'
+
+      - name: Get AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Who am I
+        run: aws sts get-caller-identity
+
+      - name: Deploy base stacks (network, messaging, ECR)
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          CFN_ROLE="arn:aws:iam::${ACCOUNT}:role/cfn-exec-${PROJECT}"
+          echo "CFN_ROLE=$CFN_ROLE" >> "$GITHUB_ENV"
+          for s in network messaging ecr; do
+            echo "::group::$PROJECT-$s"
+            aws cloudformation deploy \
+              --stack-name "$PROJECT-$s" --template-file "templates/$s.yaml" \
+              --role-arn "$CFN_ROLE" \
+              --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset \
+              --tags Project="$PROJECT" \
+              --parameter-overrides ProjectName="$PROJECT"
+            echo "::endgroup::"
+          done
+
+      - name: Build and push image tagged with the commit SHA
+        run: |
+          REPO=$(aws cloudformation describe-stacks --stack-name "$PROJECT-ecr" \
+            --query "Stacks[0].Outputs[?OutputKey=='RepositoryUri'].OutputValue" --output text)
+          echo "IMAGE=$REPO:$GITHUB_SHA" >> "$GITHUB_ENV"
+          if aws ecr describe-images --repository-name "$PROJECT-app" --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "Image $GITHUB_SHA already in ECR (tags are immutable) - skipping build"
+            exit 0
+          fi
+          aws ecr get-login-password | docker login -u AWS --password-stdin "${REPO%%/*}"
+          docker build --provenance=false -t "$REPO:$GITHUB_SHA" app
+          docker push "$REPO:$GITHUB_SHA"
+
+      - name: Gate - no CRITICAL findings in the ECR scan
+        run: |
+          aws ecr wait image-scan-complete --repository-name "$PROJECT-app" --image-id imageTag="$GITHUB_SHA"
+          aws ecr describe-image-scan-findings --repository-name "$PROJECT-app" --image-id imageTag="$GITHUB_SHA" \
+            --query imageScanFindings.findingSeverityCounts --output json
+          CRIT=$(aws ecr describe-image-scan-findings --repository-name "$PROJECT-app" --image-id imageTag="$GITHUB_SHA" \
+            --query imageScanFindings.findingSeverityCounts.CRITICAL --output text)
+          [ "$CRIT" = "None" ] && CRIT=0
+          echo "CRITICAL findings: $CRIT"
+          [ "$CRIT" = "0" ]
+
+      - name: Deploy app stack with the new image tag
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$PROJECT-app" --template-file templates/app.yaml \
+            --role-arn "$CFN_ROLE" \
+            --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset \
+            --tags Project="$PROJECT" \
+            --parameter-overrides ProjectName="$PROJECT" ImageTag="$GITHUB_SHA" Environment=prod
+
+      - name: Smoke test - the ALB serves this exact commit
+        run: |
+          URL=$(aws cloudformation describe-stacks --stack-name "$PROJECT-app" \
+            --query "Stacks[0].Outputs[?OutputKey=='AppUrl'].OutputValue" --output text)
+          for i in $(seq 1 18); do
+            BODY=$(curl -s --max-time 5 "$URL/" || true)
+            echo "try $i: $BODY"
+            if echo "$BODY" | grep -q "\"version\": \"$GITHUB_SHA\""; then
+              curl -sf "$URL/health" && echo
+              echo "### Deployed \`$GITHUB_SHA\` to $URL" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Smoke test failed: $URL does not serve $GITHUB_SHA"
+          exit 1
+
+      - name: Show the running task definition
+        run: |
+          TD=$(aws ecs describe-services --cluster "$PROJECT-cluster" --services "$PROJECT-svc" \
+            --query "services[0].taskDefinition" --output text 2>/dev/null || true)
+          echo "Task definition: $TD" | tee -a "$GITHUB_STEP_SUMMARY"

@@ -12,7 +12,7 @@ Parameters:
     AllowedValues: [dev, prod]
   ImageTag:
     Type: String
-    Description: Immutable image tag in ECR (deploy.sh passes the git commit)
+    Description: Immutable image tag in ECR (the pipeline passes the full git commit SHA)
   DesiredCount:
     Type: Number
     Default: 2
@@ -148,6 +148,8 @@ Resources:
                 Fn::Sub: "${ProjectName}-TopicArn"
             - Name: APP_ENV
               Value: !Ref Environment
+            - Name: APP_VERSION
+              Value: !Ref ImageTag
             - Name: AWS_REGION
               Value: !Ref AWS::Region
           LogConfiguration:

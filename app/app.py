@@ -1,7 +1,7 @@
 """SIS 3 demo app: tiny order API that publishes an OrderCreated domain event to SNS.
 
 GET  /health          -> 200 ok (ALB health check)
-GET  /                -> which task answered (shows load balancing)
+GET  /                -> which task answered and which commit it runs
 POST /orders          -> publish OrderCreated with a new eventId
 POST /orders?id=X     -> publish with a fixed eventId X (to demo deduplication)
 """
@@ -17,6 +17,7 @@ import boto3
 
 TOPIC_ARN = os.environ["TOPIC_ARN"]
 APP_ENV = os.environ.get("APP_ENV", "dev")
+APP_VERSION = os.environ.get("APP_VERSION", "local")  # image tag = git commit SHA
 sns = boto3.client("sns", region_name=os.environ.get("AWS_REGION", "us-east-1"))
 HOST = socket.gethostname()
 
@@ -39,7 +40,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             return self._send(200, "ok", "text/plain")
         if path == "/":
-            return self._send(200, {"service": "sis3-orders", "env": APP_ENV, "task": HOST})
+            return self._send(200, {"service": "sis3-orders", "env": APP_ENV, "version": APP_VERSION, "task": HOST})
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -65,5 +66,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    log(action="start", env=APP_ENV, task=HOST)
+    log(action="start", env=APP_ENV, version=APP_VERSION, task=HOST)
     ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
