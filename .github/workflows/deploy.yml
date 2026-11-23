@@ -97,7 +97,16 @@ jobs:
 
       - name: Gate - no CRITICAL findings in the ECR scan
         run: |
-          aws ecr wait image-scan-complete --repository-name "$PROJECT-app" --image-id imageTag="$GITHUB_SHA"
+          # Right after a push the scan may not exist yet (ScanNotFoundException), so poll the status
+          for i in $(seq 1 30); do
+            S=$(aws ecr describe-images --repository-name "$PROJECT-app" --image-ids imageTag="$GITHUB_SHA" \
+              --query 'imageDetails[0].imageScanStatus.status' --output text 2>/dev/null || echo PENDING)
+            echo "scan status: $S"
+            [ "$S" = "COMPLETE" ] && break
+            [ "$S" = "FAILED" ] && exit 1
+            sleep 10
+          done
+          [ "$S" = "COMPLETE" ] || { echo "Scan did not finish in 5 minutes"; exit 1; }
           aws ecr describe-image-scan-findings --repository-name "$PROJECT-app" --image-id imageTag="$GITHUB_SHA" \
             --query imageScanFindings.findingSeverityCounts --output json
           CRIT=$(aws ecr describe-image-scan-findings --repository-name "$PROJECT-app" --image-id imageTag="$GITHUB_SHA" \
