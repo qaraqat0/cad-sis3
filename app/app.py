@@ -38,7 +38,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
-            return self._send(503, "ok", "text/plain")  # BUG on purpose (Practice 7 failure test)
+            return self._send(200, "ok", "text/plain")
         if path == "/":
             return self._send(200, {"service": "sis3-orders", "env": APP_ENV, "version": APP_VERSION, "task": HOST})
         return self._send(404, {"error": "not found"})
